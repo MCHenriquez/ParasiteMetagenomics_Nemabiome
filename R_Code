@@ -1,0 +1,296 @@
+############ Nemabiome DADA2 Workflow ############
+# https://www.nemabiome.ca/dada2_workflow #
+
+##### SETTING UP #####
+install.packages("BiocManager")
+BiocManager::install("dada2", version = "3.16")
+
+library(DECIPHER)
+library(dada2)
+library(ShortRead)
+library(Biostrings)
+library(ggplot2)
+library(stringr) # not strictly required but handy
+library(readr)
+
+set.seed(106)
+
+#find the files
+path <- "~/Fastq"
+
+#find forward and reverse files
+fwd_files <- sort(list.files(path, pattern = "_R1_001.fastq.gz", full.names = TRUE)) 
+rev_files <- sort(list.files(path, pattern = "_R2_001.fastq.gz", full.names = TRUE))
+
+# It's also handy to have a vector of sample names, which in this case is everything up 
+# until the first underscore, which is what our regular expression caputres.  You may
+# also create this manually if you don't have too many samples
+samples = str_extract(basename(fwd_files), "^[^_]+")
+names(fwd_files) <- samples
+names(rev_files) <- samples
+
+##### ID PRIMERS #####
+# ID primers
+fwd_primer <- "CGGTGGATCACTCGGCTCGT"  ## 5.8F primer
+rev_primer <- "CCCTCACGGTACTTGTTTGCTATCG"  ## 28S CUST 5'
+fwd_primer_rev <- as.character(reverseComplement(DNAStringSet(fwd_primer)))
+rev_primer_rev <- as.character(reverseComplement(DNAStringSet(rev_primer)))
+
+# Count primers
+# This function counts number of reads in which the primer is found
+count_primers <- function(primer, filename) {
+  num_hits <- vcountPattern(primer, sread(readFastq(filename)), fixed = FALSE)
+  return(sum(num_hits > 0))
+}
+count_primers(fwd_primer, fwd_files[[1]])
+# [1] 55771
+count_primers(rev_primer, rev_files[[1]])
+# [1] 51450
+
+##### TRIM PRIMERS #####
+
+# Find Cutadapt
+cutadapt <- path.expand("/Library/Frameworks/Python.framework/Versions/3.12/bin/cutadapt")
+# Make sure it works
+system2(cutadapt, args = "--version") 
+# 4.6 - found it
+
+# Create an output directory to store the clipped files
+cut_dir <- file.path(path, "cutadapt")
+if (!dir.exists(cut_dir)) dir.create(cut_dir)
+
+fwd_cut <- file.path(cut_dir, basename(fwd_files))
+rev_cut <- file.path(cut_dir, basename(rev_files))
+
+names(fwd_cut) <- samples
+names(rev_cut) <- samples
+
+# It's good practice to keep some log files so let's create some file names that we can use for those 
+cut_logs <- path.expand(file.path(cut_dir, paste0(samples, ".log")))
+
+cutadapt_args <- c("-g", fwd_primer, #"-a", rev_primer_rev, 
+                  # "-G", rev_primer, "-A", fwd_primer_rev,
+                   "-n", 2, "--discard-untrimmed", "-m", 50, "--max-n", 1, "-q", 15) #NICE - I modified the script and added ' "-m", 50, "--max-n", 1, "-q", 15' and the plots worked
+
+#increase 50 to 200 to cut out super short 
+
+
+# Loop over the list of files, running cutadapt on each file.  If you don't have a vector of sample names or 
+# don't want to keep the log files you can set stdout = "" to output to the console or stdout = NULL to discard
+## below is *hopefully just for F reads*
+for (i in seq_along(fwd_files)) {
+  system2(cutadapt, 
+          args = c(cutadapt_args,
+                   "-o", fwd_cut[i],
+                   fwd_files[i],
+          stdout = cut_logs[i]))}  
+
+#**FOR ALL READS**
+#}
+#for (i in seq_along(fwd_files)) {
+ # system2(cutadapt, 
+  #        args = c(cutadapt_args,
+   #                "-o", fwd_cut[i], #"-p", rev_cut[i], 
+    #               fwd_files[i], #rev_files[i]),
+     #              stdout = cut_logs[i])  
+#}
+
+
+
+# quick check that we got something
+head(list.files(cut_dir))
+
+##### INSPECT QUALITY SCORES #####
+#F - looks ok
+plotQualityProfile(fwd_cut[1:5]) + ggtitle("Forward")
+#R - looks worse but ok
+plotQualityProfile(rev_cut[1:6]) + ggtitle("Reverse")
+
+##### FILTER READS #####
+# Same as for the clippling we create an output directory to store the filtered files
+filt_dir <- file.path(path, "filtered")
+if (!dir.exists(filt_dir)) dir.create(filt_dir)
+
+fwd_filt <- file.path(filt_dir, basename(fwd_files))
+rev_filt <- file.path(filt_dir, basename(rev_files))
+
+names(fwd_filt) <- samples
+names(rev_filt) <- samples
+
+#Filtering# 
+filtered_out <- filterAndTrim(
+  fwd = fwd_cut, 
+  filt = fwd_filt,
+  rev = rev_cut,
+  filt.rev = rev_filt,
+  maxEE = c(2, 5), # maximum errors on F sequences = 2, maximum on R = 5
+  truncQ = 2, # truncate after a quality score of 2 or lower
+  rm.phix = TRUE, 
+  compress = TRUE, 
+  multithread = TRUE
+)  
+#check to see if it worked
+head(filtered_out)
+#                                   reads.in reads.out
+# Li42376_S1_L001_R1_001.fastq.gz     10951      8769
+# Li42377_S13_L001_R1_001.fastq.gz    19249     16142
+# Li42378_S25_L001_R1_001.fastq.gz    15837     13869
+# Li42379_S37_L001_R1_001.fastq.gz    57172     51564
+# Li42380_S49_L001_R1_001.fastq.gz    18598     15219
+# Li42381_S61_L001_R1_001.fastq.gz     9980      8030
+
+
+##### LEARN AND PLOT ERRORS #####
+#F 
+err_fwd <- learnErrors(fwd_filt, multithread = TRUE)
+# 100759643 total bases in 553573 reads from 42 samples will be used for learning the error rates.
+#R
+err_rev <- learnErrors(rev_filt, multithread = TRUE)
+# 100078796 total bases in 561212 reads from 43 samples will be used for learning the error rates.
+#plot 
+#F
+plotErrors(err_fwd, nominalQ = TRUE)
+# Warning messages:
+# 1: Transformation introduced infinite values in continuous y-axis 
+# 2: Transformation introduced infinite values in continuous y-axis 
+# But they look ok I guess
+#R
+plotErrors(err_rev, nominalQ = TRUE)
+# Warning messages:
+# 1: Transformation introduced infinite values in continuous y-axis 
+# 2: Transformation introduced infinite values in continuous y-axis 
+
+##### ERROR CORRECTING #####
+#F
+dada_fwd <- dada(fwd_filt, err = err_fwd, multithread = TRUE)
+#R
+dada_rev <- dada(rev_filt, err = err_rev, multithread = TRUE)
+
+##### MERGE PAIRED READS AND VIEW #####
+#merge
+mergers <- mergePairs(
+  dadaF = dada_fwd,
+  dadaR = dada_rev,
+  derepF = fwd_filt,
+  derepR = rev_filt,
+  maxMismatch = 1, 
+  verbose=TRUE
+)
+#view
+#sequence table 
+seqtab <- makeSequenceTable(mergers)
+#dimensions - rows: samples x columns: sequences (ASVS written out) 
+dim(seqtab) 
+# [1]  96 708
+#96 samples x 708 ASVs
+View(seqtab)
+# interesting! 
+
+##### REMOVE CHIMERAS AND VIEW SEQUENCE TABLE #####
+seqtab_nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+# Identified 37 bimeras out of 708 input sequences.
+dim(seqtab_nochim)
+# [1]  96 671
+View(seqtab_nochim)
+# download it
+write.csv2(seqtab_nochim, file = "MiSeq_Seq_Tab_NoChim.csv", row.names = TRUE)
+#transpose it
+t_seqtab_nochim <-t(seqtab_nochim)
+View (t_seqtab_nochim)
+# download it again
+write.csv2(t_seqtab_nochim, file = "MiSeq_Seq_Tab_NoChim_trans.csv", row.names = TRUE)
+
+# Sequence length distribution
+table(nchar(getSequences(seqtab_nochim)))
+# big distribution - 50 - 442
+
+##### CHECK READS AT EACH STEP #####
+# small function to get the number of sequences
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(
+  filtered_out, 
+  sapply(dada_fwd, getN), 
+  sapply(dada_rev, getN), 
+  sapply(mergers, getN), 
+  rowSums(seqtab_nochim)
+)
+
+colnames(track) <- c("raw", "filtered", "denoised_fwd", "denoised_rev", "merged", "no_chim")
+rownames(track) <- samples  
+head(track)
+View(track)
+# download table
+write.csv2(track, file = "reads_at_each_step.csv", row.names = TRUE)
+
+##### ASSIGN TAXONOMY #####
+
+### TRAIN CLASSIFIER ###
+train <- readDNAStringSet("~/Desktop/Nematode_ITS2_1.0.0_idtaxa.fasta")
+#make sure its downloaded off the cloud or it'll give you an error
+tax <- read_tsv("~/Desktop/Nematode_ITS2_1.0.0_idtaxa.tax")
+# Train the classifier
+trainingSet <- LearnTaxa(train, names(train), tax)
+# Time difference of 168.43 secs
+
+### RUN THE CLASSIFIER ###
+dna <- DNAStringSet(getSequences(seqtab_nochim))
+
+idtaxa <- IdTaxa(dna, 
+                 trainingSet, 
+                 strand = "both", 
+                 threshold = 10, # changed from 60 to 10 because 60 gave no results
+                 bootstraps = 100, 
+                 processors = NULL, 
+                 verbose = TRUE, 
+                 type = "extended")
+View(idtaxa)
+ 
+
+idtaxa1 <- IdTaxa(dna, 
+                 trainingSet, 
+                 strand = "both", 
+                 threshold = 10, # changed from 60 to 10 because 60 gave no results
+                 bootstraps = 100, 
+                 processors = NULL, 
+                 verbose = TRUE, 
+                 type = "collapsed")
+View(idtaxa1)
+#can I download it?
+write.csv2(idtaxa1, file = "IDTAXA_OUTPUT.csv", row.names = TRUE)
+
+
+
+# strand = "both" : by setting the strand parameter to “both”, each sequence variant is 
+# classified using both the forward and reverse complement orientation.
+# The sequence varient will be classified as the result with the highest confidence.
+# threshold = 60 : setting the threshold to 60 specifies when the taxonomic classifications 
+# are truncated. A lower threshold usually results in higher taxonomic level classifications, 
+# but lower accuracy (i.e. confidence). A higher threshold usually results in lower taxonomic 
+# level classifications, but with higher accuracy.
+# bootstraps = 100 : this specifies the amount of times bootstrap replicates are 
+# performed for each sequence.
+# processors = NULL : automatically uses all available processors.
+# verbose = TRUE : displays progress.
+# type = "extended" : by setting the type to “extended”, the output for 
+# each sequence variant will contain the taxonomic classification, 
+# the names of each taxonomic rank, and the confidence of the assignment.
+
+taxid <- t(sapply(idtaxa, function(x) setNames(x$taxon, x$rank)))[, -1]
+View(taxid)
+
+##### PHYLOSEQ #####
+
+library(phyloseq)
+# This is just a placeholder - normally this would be a dataframe containing all your sample inforamtion,
+# with rownames matching the sample names
+samp_data <-  data.frame(
+  row.names = samples,
+  sample = samples
+)
+
+# We need better tables for our sequences than the actual sequence which is the dada2 default
+asvs <- paste0("ASV_", 1:length(dna))
+rownames(taxid) <- asvs
+colnames(seqtab_nochim) <- asvs
+names(dna) <- asvs
